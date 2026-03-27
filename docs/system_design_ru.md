@@ -31,4 +31,9 @@
 - Проверка качества датасета перед обучением:
 	- `python scripts/check_dataset_quality.py --dataset datasets/processed/unified`
 - Обучение hybrid-модели на объединенном наборе:
-	- `python -m ai_core.training.train_hybrid --config configs/hybrid_train.yaml --out artifacts/hybrid_model.pt`
+	- `python -m ai_core.training.train_hybrid --config configs/hybrid_train.yaml --out artifacts/hybrid_model.pt --workers 2 --save-every 1`
+- Во время обучения автоматически считаются валидационные метрики (`val_loss`, `val_cls_acc`, `val_mask_iou`) и сохраняются:
+	- `artifacts/hybrid_model_best.pt`
+	- `artifacts/checkpoints/epoch_XXX.pt`
+- Sanity-проверка с GT (precision/recall/F1):
+	- `python scripts/eval_inference_sanity.py --images datasets/processed/unified/images/val --weights artifacts/hybrid_model_best.pt`

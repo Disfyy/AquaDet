@@ -11,6 +11,7 @@ from typing import Iterable, List
 
 import cv2
 import numpy as np
+import yaml
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
 
@@ -89,6 +90,51 @@ def link_or_copy(src: Path, dst: Path, copy_mode: bool) -> None:
         dst.symlink_to(src.resolve())
 
 
+def load_class_map(path: Path | None) -> dict[str, dict[int, int]]:
+    if path is None or not path.exists():
+        return {}
+    with path.open("r", encoding="utf-8") as f:
+        payload = yaml.safe_load(f) or {}
+    output: dict[str, dict[int, int]] = {}
+    for source_name, mapping in payload.items():
+        source_map: dict[int, int] = {}
+        if isinstance(mapping, dict):
+            for key, value in mapping.items():
+                try:
+                    source_map[int(key)] = int(value)
+                except (TypeError, ValueError):
+                    continue
+        output[str(source_name)] = source_map
+    return output
+
+
+def remap_label_file(
+    label_src: Path,
+    label_dst: Path,
+    source: str,
+    class_map: dict[str, dict[int, int]],
+) -> int:
+    source_map = class_map.get(source, {})
+    default_map = class_map.get("default", {})
+    kept = 0
+    with label_src.open("r", encoding="utf-8") as src, label_dst.open("w", encoding="utf-8") as dst:
+        for line in src:
+            parts = line.strip().split()
+            if len(parts) < 5:
+                continue
+            try:
+                cls = int(float(parts[0]))
+            except ValueError:
+                continue
+
+            mapped = source_map.get(cls, default_map.get(cls, cls))
+            if mapped < 0:
+                continue
+            dst.write(f"{mapped} {' '.join(parts[1:])}\n")
+            kept += 1
+    return kept
+
+
 def split_samples(samples: List[Sample], train_ratio: float, val_ratio: float, seed: int) -> dict[str, List[Sample]]:
     random.Random(seed).shuffle(samples)
     n = len(samples)
@@ -103,13 +149,21 @@ def split_samples(samples: List[Sample], train_ratio: float, val_ratio: float, s
     }
 
 
-def write_split(out_root: Path, split: str, samples: List[Sample], copy_mode: bool) -> None:
+def write_split(
+    out_root: Path,
+    split: str,
+    samples: List[Sample],
+    copy_mode: bool,
+    class_map: dict[str, dict[int, int]],
+) -> None:
     for idx, sample in enumerate(samples):
         name = f"{sample.source}_{idx:06d}"
         image_dst = out_root / "images" / split / f"{name}{sample.image.suffix.lower()}"
         label_dst = out_root / "labels" / split / f"{name}.txt"
         link_or_copy(sample.image, image_dst, copy_mode=copy_mode)
-        link_or_copy(sample.label, label_dst, copy_mode=copy_mode)
+        kept = remap_label_file(sample.label, label_dst, sample.source, class_map=class_map)
+        if kept == 0 and label_dst.exists():
+            label_dst.unlink()
 
 
 def class_histogram(samples: List[Sample]) -> dict[int, int]:
@@ -203,6 +257,7 @@ def main() -> None:
     parser.add_argument("--copy", action="store_true", help="Copy files instead of symlink")
     parser.add_argument("--bootstrap-synthetic-count", type=int, default=0)
     parser.add_argument("--bootstrap-image-size", type=int, default=640)
+    parser.add_argument("--class-map", type=Path, default=Path("configs/class_map.yaml"))
     args = parser.parse_args()
 
     if not 0.0 < args.train_ratio < 1.0:
@@ -235,8 +290,9 @@ def main() -> None:
             )
 
     split_map = split_samples(samples, train_ratio=args.train_ratio, val_ratio=args.val_ratio, seed=args.seed)
+    class_map = load_class_map(args.class_map)
     for split, split_samples_list in split_map.items():
-        write_split(out_root, split, split_samples_list, copy_mode=args.copy)
+        write_split(out_root, split, split_samples_list, copy_mode=args.copy, class_map=class_map)
 
     write_manifest(out_root, split_map)
     write_stats(out_root, split_map)

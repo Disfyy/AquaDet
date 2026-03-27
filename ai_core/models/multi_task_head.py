@@ -20,5 +20,5 @@ class MultiTaskHead(nn.Module):
         return {
             "logits": self.cls_head(p3),
             "boxes": self.box_head(p3),
-            "masks": torch.sigmoid(self.mask_head(p3)),
+            "masks": self.mask_head(p3),
         }

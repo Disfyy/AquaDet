@@ -48,6 +48,10 @@ For best efficiency/accuracy tradeoff in this architecture:
 - Monocular depth supervision: SUIM or synthetic simulator depth
 
 Map your prepared folders in `configs/hybrid_train.yaml` under `data.image_dirs`.
+Prefer explicit split keys:
+
+- `data.train_image_dirs`
+- `data.val_image_dirs`
 
 ## Prepare all local datasets
 
@@ -55,7 +59,7 @@ Aggregate all labeled data from `datasets/raw`, `datasets/external`, `datasets/p
 into one unified YOLO-style train/val/test structure:
 
 ```bash
-python scripts/prepare_hybrid_dataset.py --dataset-root datasets
+python scripts/prepare_hybrid_dataset.py --dataset-root datasets --class-map configs/class_map.yaml
 ```
 
 If real data is not downloaded yet, generate a temporary synthetic dataset for end-to-end checks:
@@ -73,5 +77,47 @@ python scripts/check_dataset_quality.py --dataset datasets/processed/unified
 ## Train hybrid model
 
 ```bash
-python -m ai_core.training.train_hybrid --config configs/hybrid_train.yaml --out artifacts/hybrid_model.pt
+python -m ai_core.training.train_hybrid --config configs/hybrid_train.yaml --out artifacts/hybrid_model.pt --workers 2 --save-every 1
 ```
+
+This now saves:
+- latest model: `artifacts/hybrid_model.pt`
+- best model: `artifacts/hybrid_model_best.pt`
+- epoch checkpoints: `artifacts/checkpoints/epoch_XXX.pt`
+
+## Sanity check with GT metrics
+
+```bash
+python scripts/eval_inference_sanity.py \
+	--images datasets/processed/unified/images/val \
+	--weights artifacts/hybrid_model_best.pt \
+	--max-images 50 \
+	--min-avg-detections 0.3 \
+	--min-avg-confidence 0.2 \
+	--min-unique-classes 2 \
+	--min-precision 0.05 \
+	--min-recall 0.05
+```
+
+## Kaggle run (ready now)
+
+1) Upload/import your dataset in Kaggle with structure:
+
+- `/kaggle/input/aquadet-unified/images/train`
+- `/kaggle/input/aquadet-unified/images/val`
+- `/kaggle/input/aquadet-unified/labels/train`
+- `/kaggle/input/aquadet-unified/labels/val`
+
+2) In Kaggle Notebook, clone/copy this project into `/kaggle/working/AquaDet`.
+
+3) Run training via helper:
+
+```bash
+cd /kaggle/working/AquaDet
+python scripts/kaggle_train.py \
+	--project-root /kaggle/working/AquaDet \
+	--input-dataset /kaggle/input/aquadet-unified \
+	--epochs 20 --batch 8 --imgsz 640 --workers 2
+```
+
+Output weights are saved to `/kaggle/working/artifacts/` and can be downloaded as Notebook output.

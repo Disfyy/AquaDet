@@ -1,0 +1,23 @@
+# Per-source class remapping into AquaDet classes:
+# 0=plastic, 1=metal, 2=organic, 3=microplastic
+# Use -1 to drop a source class.
+
+default:
+  0: 0
+  1: 1
+  2: 2
+  3: 3
+
+# Example source-specific overrides (edit for your dataset labels)
+trash_icra19:
+  0: 0
+  1: 2
+  2: 1
+
+taco:
+  0: 0
+  1: 0
+  2: 1
+  3: 2
+  4: 0
+  5: 3

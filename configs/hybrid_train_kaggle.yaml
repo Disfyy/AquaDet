@@ -4,14 +4,14 @@ model:
 
 data:
   train_image_dirs:
-    - datasets/processed/unified/images/train
+    - /kaggle/input/aquadet-unified/images/train
   val_image_dirs:
-    - datasets/processed/unified/images/val
-  enhancement_pairs_dir: datasets/processed/uieb
-  depth_supervision_dir: datasets/processed/suim
+    - /kaggle/input/aquadet-unified/images/val
+  enhancement_pairs_dir: /kaggle/input/uieb
+  depth_supervision_dir: /kaggle/input/suim
 
 train:
-  epochs: 50
+  epochs: 20
   batch_size: 8
   lr: 0.0001
   image_size: 640

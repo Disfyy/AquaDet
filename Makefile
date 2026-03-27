@@ -1,6 +1,6 @@
-PYTHON ?= python3
+PYTHON ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
 
-.PHONY: install install-train lint api mock-iot demo export-onnx prepare-data bootstrap-data check-data train-hybrid eval-sanity
+.PHONY: install install-train lint api mock-iot demo export-onnx prepare-data bootstrap-data check-data train-hybrid train-hybrid-smoke eval-sanity
 
 install:
 	$(PYTHON) -m pip install -r requirements.txt
@@ -30,13 +30,16 @@ check-data:
 	$(PYTHON) scripts/check_dataset_quality.py --dataset datasets/processed/unified
 
 train-hybrid:
-	$(PYTHON) -m ai_core.training.train_hybrid --config configs/hybrid_train.yaml --out artifacts/hybrid_model.pt
+	$(PYTHON) -m ai_core.training.train_hybrid --config configs/hybrid_train.yaml --out artifacts/hybrid_model.pt --workers 2 --save-every 1
+
+train-hybrid-smoke:
+	$(PYTHON) -m ai_core.training.train_hybrid --config configs/hybrid_train.yaml --epochs 1 --batch 4 --imgsz 160 --workers 0 --max-train-steps 120 --max-val-steps 40 --out artifacts/hybrid_model_smoke.pt
 
 eval-sanity:
-	$(PYTHON) scripts/eval_inference_sanity.py --images datasets/processed/unified/images/val --weights artifacts/hybrid_model.pt --max-images 30
+	$(PYTHON) scripts/eval_inference_sanity.py --images datasets/processed/unified/images/val --weights artifacts/hybrid_model.pt --max-images 30 --min-precision 0.05 --min-recall 0.05
 
 train-hybrid-live:
-	PYTHONUNBUFFERED=1 $(PYTHON) -u -m ai_core.training.train_hybrid --config configs/hybrid_train.yaml --out artifacts/hybrid_model.pt --log-interval 50
+	PYTHONUNBUFFERED=1 $(PYTHON) -u -m ai_core.training.train_hybrid --config configs/hybrid_train.yaml --out artifacts/hybrid_model.pt --log-interval 50 --workers 2 --save-every 1
 
 export-onnx:
 	$(PYTHON) edge/export/export_onnx.py --output artifacts/hybrid_model.onnx

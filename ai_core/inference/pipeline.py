@@ -28,6 +28,7 @@ class AquaDetPipeline:
         max_detections: int = 50,
         config_path: Path | None = None,
         weights_path: Path | None = None,
+        strict_weights: bool = True,
     ):
         if config_path is not None and Path(config_path).exists():
             with Path(config_path).open("r", encoding="utf-8") as f:
@@ -42,9 +43,14 @@ class AquaDetPipeline:
         self.model = AquaDetHybridModel(num_classes=len(CLASS_NAMES), pi_ge_enabled=enable_pi_ge)
         if weights_path is not None and Path(weights_path).exists():
             state = torch.load(weights_path, map_location="cpu")
-            self.model.load_state_dict(state, strict=False)
+            self.model.load_state_dict(state, strict=strict_weights)
+        elif weights_path is not None:
+            raise FileNotFoundError(f"weights not found: {weights_path}")
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.to(self.device)
         self.model.eval()
-        self.tracker = SimpleIoUTracker(iou_threshold=0.3)
+        self.tracker = SimpleIoUTracker(iou_threshold=0.3, max_missed=10)
         self.focal_length_mm = focal_length_mm
         self.conf_threshold = conf_threshold
         self.nms_iou_threshold = nms_iou_threshold
@@ -54,7 +60,7 @@ class AquaDetPipeline:
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         x = frame_rgb.astype(np.float32) / 255.0
         x = torch.from_numpy(x).permute(2, 0, 1).unsqueeze(0)
-        return x
+        return x.to(self.device)
 
     @staticmethod
     def _bbox_iou(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> float:
@@ -119,6 +125,8 @@ class AquaDetPipeline:
         for cand in candidates:
             keep = True
             for picked in kept:
+                if cand["class_idx"] != picked["class_idx"]:
+                    continue
                 if self._bbox_iou(cand["bbox"], picked["bbox"]) > self.nms_iou_threshold:
                     keep = False
                     break
@@ -135,6 +143,7 @@ class AquaDetPipeline:
 
         with torch.no_grad():
             outputs: Dict[str, torch.Tensor] = self.model(x)
+            outputs = {k: v.detach().cpu() for k, v in outputs.items()}
 
         logits = outputs["logits"]
         boxes = outputs["boxes"]
@@ -145,7 +154,7 @@ class AquaDetPipeline:
         bboxes = [d["bbox"] for d in decoded]
         tracks = self.tracker.update(bboxes)
 
-        mask_map = masks[0, 0].detach().cpu().numpy()
+        mask_map = torch.sigmoid(masks[0, 0]).numpy()
         mask_full_res = cv2.resize(mask_map, (w, h), interpolation=cv2.INTER_LINEAR)
         mask_binary = (mask_full_res >= 0.5).astype(np.uint8)
 
