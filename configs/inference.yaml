@@ -1,0 +1,10 @@
+camera:
+  frame_width: 1280
+  frame_height: 720
+  focal_length_mm: 4.25
+
+runtime:
+  enable_pi_ge: true
+  tracker: bytetrack
+  conf_threshold: 0.3
+  max_detections: 50

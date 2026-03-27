@@ -1,0 +1,1 @@
+"""AquaDet AI core package."""

@@ -1,0 +1,22 @@
+model:
+  num_classes: 4
+  pi_ge_enabled: true
+
+data:
+  image_dirs:
+    - datasets/processed/unified/images/train
+    - datasets/processed/unified/images/val
+  enhancement_pairs_dir: datasets/processed/uieb
+  depth_supervision_dir: datasets/processed/suim
+
+train:
+  epochs: 50
+  batch_size: 8
+  lr: 0.0001
+  image_size: 640
+
+loss_weights:
+  cls: 1.0
+  bbox: 2.0
+  mask: 1.0
+  depth: 0.2
