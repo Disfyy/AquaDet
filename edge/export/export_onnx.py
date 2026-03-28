@@ -25,6 +25,16 @@ def main() -> None:
     dummy = torch.randn(1, 3, args.height, args.width)
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
+    # Dynamic axes for TensorRT optimization and dynamic stream sizing
+    dynamic_axes = {
+        "image": {0: "batch_size", 2: "height", 3: "width"},
+        "logits": {0: "batch_size", 2: "height", 3: "width"},
+        "boxes": {0: "batch_size", 2: "height", 3: "width"},
+        "masks": {0: "batch_size", 2: "height", 3: "width"},
+        "depth": {0: "batch_size", 2: "height", 3: "width"},
+    }
+
+    print(f"Exporting ONNX with dynamic input axes to {args.output}...")
     torch.onnx.export(
         model,
         dummy,
@@ -33,8 +43,9 @@ def main() -> None:
         output_names=["logits", "boxes", "masks", "depth"],
         opset_version=17,
         do_constant_folding=True,
+        dynamic_axes=dynamic_axes,
     )
-    print(f"Exported ONNX: {args.output}")
+    print("Export successful. Ready for TensorRT (trtexec) engine compilation.")
 
 
 if __name__ == "__main__":
