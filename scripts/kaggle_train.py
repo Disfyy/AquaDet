@@ -8,7 +8,7 @@ from pathlib import Path
 import yaml
 
 
-DEFAULT_INPUT_DATASET = "/kaggle/input/aquadet-unified"
+DEFAULT_INPUT_DATASET = "/kaggle/input/datasets/disfyy/aquadet-unified"
 DEFAULT_WORKING_ROOT = "/kaggle/working/AquaDet"
 
 
