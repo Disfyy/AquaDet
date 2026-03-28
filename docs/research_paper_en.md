@@ -114,3 +114,31 @@ It is inherently advised that the lead researcher progressively migrates focus d
 
 **Mentor Name / Signature:** ___________________________  
 **Date:** ___________________
+### 3.5. Comparative Architecture Analysis and Future Improvements
+To contextualize AquaDet architecture, it is critical to compare its pipeline against existing State-of-the-Art (SOTA) oceanographic frameworks, identifying specific vectors for future improvement.
+
+#### Current Architecture Breakdown
+The AquaDet system operates via a decoupled, sequential multi-stage pipeline:
+1.  **Input Layer:** RGB frames are ingested directly from standard camera hardware.
+2.  **PI-GE Pre-Processing:** Unlike standard networks that feed raw pixels to the backbone, AquaDet passes the input through the Physical-Image-Geometry Enhancement module. This sub-network explicitly learns the water transmission map (t) and backscatter (A) to mathematically invert the underwater image formation model, outputting a color-restored tensor.
+3.  **Hybrid Backbone & BiFPN:** The restored tensor is processed by a Hybrid CNN. The semantic features are passed through a Bidirectional Feature Pyramid Network (BiFPN)—a technique popularized by EfficientDet to fuse multi-scale features, allowing the network to retain highly localized textures (microplastics) and global shapes (large debris).
+4.  **Multi-Task Heads:** The BiFPN output diverges into parallel algorithmic branches:
+    *   **Classification & Bounding Box Head:** Outputs the item class and 2D coordinates.
+    *   **Mask Head:** Produces binary semantic segmentation for precise shape outlining.
+    *   **ASPP Depth Head:** Utilizes Atrous convolutions (dilations of 1, 6, 12) to deduce relative object distance from the camera.
+5.  **Tracking & Sizing Module:** Finally, a SimpleIoUTracker maintains temporal identity across video frames, while a deterministic mathematical function evaluates the depth vector against the camera focal length to output the real-world mm size.
+
+#### Comparative Ecosystem Analysis and Upgrades
+Referencing other specialized projects reveals clear pathways for geometric enhancement:
+
+*   **Comparison to YOLOv8/v10 (Ultralytics):** Modern YOLO architectures are strictly optimized for bounding-box speed. They lack native physical light-restoration layers, forcing engineers to pre-process images utilizing traditional algorithms (like CLAHE or DCP) sequentially on the CPU, heavily throttling Edge compute speeds. AquaDet resolves this by embedding PI-GE into the GPU forward pass. 
+    *   *Improvement Vector:* YOLOv10 recently introduced NMS-free (Non-Maximum Suppression-free) training paradigms. Adopting an NMS-free end-to-end framework within AquaDet Classification Head could theoretically reduce Jetson inference latency by an additional 15-20%.
+
+*   **Comparison to OceanEye / Sea-Thru:** Projects like Sea-Thru utilize RGB-D (Depth) cameras or stereo-vision to calculate the water attenuation coefficient mapped against a strict 3D topological background. While highly accurate, stereo-rigs are bulky and expensive. AquaDet relies purely on monocular (single-lens) ASPP estimation.
+    *   *Improvement Vector:* The current ASPP Depth head calculates depth implicitly based on learned visual cues relative to object scale. Upgrading the architecture to utilize **Self-Supervised Monocular Depth Estimation (e.g., Monodepth2)** trained on sequential video frames (utilizing photometric reprojection error) would vastly stabilize distance measurements without requiring stereo-hardware.
+
+*   **Comparison to Swin-Transformer based models:** Cutting-edge underwater analysis has begun migrating from pure CNN backbones towards Vision Transformers (ViTs) like Swin. Transformers excel at establishing global context (understanding how water color shifts across the entire field of view), which is highly beneficial for the PI-GE module.
+    *   *Improvement Vector:* Replacing the standard Hybrid CNN backbone with a lightweight **MobileViT or Swin-T (Tiny)** architecture could dramatically increase the network capacity to estimate global backscatter (A) without significantly elevating FLOPs (Floating Point Operations per Second).
+
+*   **Acoustic & Sensor Fusion (Future Scope):** Industry-standard AUVs (like those deployed by the Ocean Cleanup project) rely heavily on sonar. Sonar sees perfectly through zero-visibility silt but cannot distinguish a plastic bottle from a rock. 
+    *   *Improvement Vector:* The ultimate architectural upgrade involves **multimodal sensor fusion**. By piping 1D active Sonar returns directly into the BiFPN layer and concatenating them alongside the RGB visual features, the network could cross-reference the acoustic shape with the PI-GE color data, enabling 100% operational uptime regardless of total visual blackout.
