@@ -52,6 +52,10 @@ def main() -> None:
     project_root = args.project_root.resolve()
     input_root = args.input_dataset.resolve()
 
+    # The dataset zip might extract into a nested 'unified' folder
+    if not (input_root / "images" / "train").exists() and (input_root / "unified" / "images" / "train").exists():
+        input_root = input_root / "unified"
+
     train_images = input_root / "images" / "train"
     val_images = input_root / "images" / "val"
 
