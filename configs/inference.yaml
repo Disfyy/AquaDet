@@ -2,6 +2,7 @@ camera:
   frame_width: 1280
   frame_height: 720
   focal_length_mm: 4.25
+  sensor_width_mm: 3.68
 
 runtime:
   enable_pi_ge: true

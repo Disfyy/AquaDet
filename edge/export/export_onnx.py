@@ -31,6 +31,7 @@ def main() -> None:
         "logits": {0: "batch_size", 2: "height", 3: "width"},
         "boxes": {0: "batch_size", 2: "height", 3: "width"},
         "masks": {0: "batch_size", 2: "height", 3: "width"},
+        "obj": {0: "batch_size", 2: "height", 3: "width"},
         "depth": {0: "batch_size", 2: "height", 3: "width"},
     }
 
@@ -40,13 +41,38 @@ def main() -> None:
         dummy,
         str(args.output),
         input_names=["image"],
-        output_names=["logits", "boxes", "masks", "depth"],
+        output_names=["logits", "boxes", "masks", "obj", "depth"],
         opset_version=17,
         do_constant_folding=True,
         dynamic_axes=dynamic_axes,
     )
-    print("Export successful. Ready for TensorRT (trtexec) engine compilation.")
+    print("Export successful. Testing output validity...")
 
+    try:
+        import onnx
+        model_onnx = onnx.load(str(args.output))
+        onnx.checker.check_model(model_onnx)
+        print("ONNX model checker passed.")
+
+        import onnxruntime as ort
+        import numpy as np
+        
+        # Pure inference outputs from torch for verification
+        with torch.no_grad():
+            pt_out = model(dummy)
+
+        sess = ort.InferenceSession(str(args.output), providers=['CPUExecutionProvider'])
+        ort_out = sess.run(None, {"image": dummy.numpy()})
+
+        for key, ort_val in zip(["logits", "boxes", "masks", "obj", "depth"], ort_out):
+            np.testing.assert_allclose(pt_out[key].numpy(), ort_val, atol=1e-4, rtol=1e-3)
+            
+        print("Numerical validation passed. Max absolute error is within 1e-4 tolerance.")
+        print("Ready for TensorRT (trtexec) engine compilation.")
+    except ImportError as e:
+        print(f"Skipping validation step due to missing dependency: {e}")
+    except Exception as e:
+        print(f"Validation failed: {e}")
 
 if __name__ == "__main__":
     main()

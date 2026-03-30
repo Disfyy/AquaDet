@@ -2,26 +2,34 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 import torch
+import torchvision
 import yaml
 
 from ai_core.models.hybrid_model import AquaDetHybridModel
-from ai_core.utils.geometry import estimate_real_size_mm
+from ai_core.utils.geometry import estimate_real_size_mm, focal_length_mm_to_px
 from ai_core.utils.types import Detection, FrameResult
 from .tracker import SimpleIoUTracker
 
 
-CLASS_NAMES = ["plastic", "metal", "organic", "microplastic"]
+DEFAULT_CLASS_NAMES = ["plastic", "metal", "organic", "microplastic"]
 
 
 class AquaDetPipeline:
+    """End-to-end inference pipeline for AquaDet.
+
+    Handles preprocessing, model inference, NMS, tracking, depth-based
+    size estimation, and result packaging.
+    """
+
     def __init__(
         self,
         focal_length_mm: float = 4.25,
+        sensor_width_mm: float = 3.68,
         enable_pi_ge: bool = True,
         conf_threshold: float = 0.3,
         nms_iou_threshold: float = 0.5,
@@ -29,18 +37,31 @@ class AquaDetPipeline:
         config_path: Path | None = None,
         weights_path: Path | None = None,
         strict_weights: bool = True,
+        model_size: int = 640,
+        class_names: List[str] | None = None,
     ):
+        self.model_size = model_size
+        self.sensor_width_mm = sensor_width_mm
+
         if config_path is not None and Path(config_path).exists():
             with Path(config_path).open("r", encoding="utf-8") as f:
                 cfg = yaml.safe_load(f) or {}
             camera_cfg = cfg.get("camera", {})
             runtime_cfg = cfg.get("runtime", {})
             focal_length_mm = float(camera_cfg.get("focal_length_mm", focal_length_mm))
+            self.sensor_width_mm = float(camera_cfg.get("sensor_width_mm", sensor_width_mm))
             enable_pi_ge = bool(runtime_cfg.get("enable_pi_ge", enable_pi_ge))
             conf_threshold = float(runtime_cfg.get("conf_threshold", conf_threshold))
             max_detections = int(runtime_cfg.get("max_detections", max_detections))
 
-        self.model = AquaDetHybridModel(num_classes=len(CLASS_NAMES), pi_ge_enabled=enable_pi_ge)
+            # Load class names from config if available
+            if "classes" in cfg:
+                class_names = cfg["classes"]
+
+        self.class_names = class_names or DEFAULT_CLASS_NAMES
+        num_classes = len(self.class_names)
+
+        self.model = AquaDetHybridModel(num_classes=num_classes, pi_ge_enabled=enable_pi_ge)
         if weights_path is not None and Path(weights_path).exists():
             state = torch.load(weights_path, map_location="cpu")
             self.model.load_state_dict(state, strict=strict_weights)
@@ -56,90 +77,90 @@ class AquaDetPipeline:
         self.nms_iou_threshold = nms_iou_threshold
         self.max_detections = max_detections
 
-    def _preprocess(self, frame_bgr: np.ndarray) -> torch.Tensor:
+    def _preprocess(self, frame_bgr: np.ndarray) -> Tuple[torch.Tensor, Tuple[int, int]]:
+        h, w = frame_bgr.shape[:2]
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        x = frame_rgb.astype(np.float32) / 255.0
+        frame_resized = cv2.resize(frame_rgb, (self.model_size, self.model_size))
+        x = frame_resized.astype(np.float32) / 255.0
         x = torch.from_numpy(x).permute(2, 0, 1).unsqueeze(0)
-        return x.to(self.device)
-
-    @staticmethod
-    def _bbox_iou(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> float:
-        x1 = max(a[0], b[0])
-        y1 = max(a[1], b[1])
-        x2 = min(a[2], b[2])
-        y2 = min(a[3], b[3])
-        inter = max(0, x2 - x1) * max(0, y2 - y1)
-        area_a = max(1, (a[2] - a[0]) * (a[3] - a[1]))
-        area_b = max(1, (b[2] - b[0]) * (b[3] - b[1]))
-        union = area_a + area_b - inter
-        return inter / union if union > 0 else 0.0
+        return x.to(self.device), (h, w)
 
     def _decode_predictions(
         self,
         logits_map: torch.Tensor,
         box_map: torch.Tensor,
+        obj_map: torch.Tensor,
         h: int,
         w: int,
     ) -> List[Dict[str, object]]:
-        cls_scores = torch.sigmoid(logits_map[0])
-        conf_map, cls_map = torch.max(cls_scores, dim=0)
-        box_pred = box_map[0]
+        """Decode grid-based predictions into bounding boxes with GPU-accelerated NMS."""
+        # Combined confidence = sigmoid(obj) * max(sigmoid(cls))
+        obj_scores = torch.sigmoid(obj_map[0, 0])  # (H, W)
+        cls_scores = torch.sigmoid(logits_map[0])   # (C, H, W)
+        cls_max_scores, cls_indices = torch.max(cls_scores, dim=0)  # (H, W)
+        conf_map = obj_scores * cls_max_scores  # (H, W)
 
+        box_pred = box_map[0]  # (4, H, W)
         hh, ww = conf_map.shape
+
+        # Flatten and filter by confidence
         flat_scores = conf_map.reshape(-1)
-        if flat_scores.numel() == 0:
+        mask = flat_scores >= self.conf_threshold
+        if not mask.any():
             return []
 
-        topk = min(self.max_detections * 4, flat_scores.numel())
-        scores_topk, indices_topk = torch.topk(flat_scores, k=max(1, topk), largest=True, sorted=True)
+        indices = mask.nonzero(as_tuple=True)[0]
+        scores = flat_scores[indices]
 
-        candidates: List[Dict[str, object]] = []
-        for score, idx in zip(scores_topk.tolist(), indices_topk.tolist()):
-            if score < self.conf_threshold:
-                break
+        # Limit candidates
+        if scores.numel() > self.max_detections * 4:
+            topk = min(self.max_detections * 4, scores.numel())
+            scores, top_indices = torch.topk(scores, k=topk, largest=True, sorted=True)
+            indices = indices[top_indices]
 
-            gy = idx // ww
-            gx = idx % ww
+        # Decode boxes
+        gy = indices // ww
+        gx = indices % ww
 
-            tx, ty, tw, th = box_pred[:, gy, gx]
-            cx = (gx + torch.sigmoid(tx).item()) / ww * w
-            cy = (gy + torch.sigmoid(ty).item()) / hh * h
-            bw = max(2.0, torch.sigmoid(tw).item() * w * 0.5)
-            bh = max(2.0, torch.sigmoid(th).item() * h * 0.5)
+        tx = box_pred[0][gy, gx]
+        ty = box_pred[1][gy, gx]
+        tw = box_pred[2][gy, gx]
+        th = box_pred[3][gy, gx]
 
-            x1 = max(0, cx - bw // 2)
-            y1 = max(0, cy - bh // 2)
-            x2 = min(w - 1, cx + bw // 2)
-            y2 = min(h - 1, cy + bh // 2)
+        cx = (gx.float() + torch.sigmoid(tx)) / ww * w
+        cy = (gy.float() + torch.sigmoid(ty)) / hh * h
+        bw = torch.clamp(torch.sigmoid(tw) * w * 0.5, min=2.0)
+        bh = torch.clamp(torch.sigmoid(th) * h * 0.5, min=2.0)
 
-            cls_idx = int(cls_map[gy, gx].item())
-            candidates.append(
-                {
-                    "bbox": (int(x1), int(y1), int(x2), int(y2)),
-                    "confidence": float(score),
-                    "class_idx": cls_idx,
-                }
-            )
+        x1 = torch.clamp(cx - bw / 2, min=0)
+        y1 = torch.clamp(cy - bh / 2, min=0)
+        x2 = torch.clamp(cx + bw / 2, max=w - 1)
+        y2 = torch.clamp(cy + bh / 2, max=h - 1)
 
-        kept: List[Dict[str, object]] = []
-        for cand in candidates:
-            keep = True
-            for picked in kept:
-                if cand["class_idx"] != picked["class_idx"]:
-                    continue
-                if self._bbox_iou(cand["bbox"], picked["bbox"]) > self.nms_iou_threshold:
-                    keep = False
-                    break
-            if keep:
-                kept.append(cand)
-            if len(kept) >= self.max_detections:
-                break
+        boxes_xyxy = torch.stack([x1, y1, x2, y2], dim=1)  # (N, 4)
+        cls_ids = cls_indices[gy, gx]
 
-        return kept
+        # GPU-accelerated NMS (class-agnostic first to prevent cross-class duplicates)
+        keep = torchvision.ops.nms(boxes_xyxy, scores, self.nms_iou_threshold)
+        keep = keep[:self.max_detections]
+
+        results: List[Dict[str, object]] = []
+        for idx in keep.tolist():
+            results.append({
+                "bbox": (
+                    int(boxes_xyxy[idx, 0].item()),
+                    int(boxes_xyxy[idx, 1].item()),
+                    int(boxes_xyxy[idx, 2].item()),
+                    int(boxes_xyxy[idx, 3].item()),
+                ),
+                "confidence": float(scores[idx].item()),
+                "class_idx": int(cls_ids[idx].item()),
+            })
+
+        return results
 
     def infer_frame(self, frame_bgr: np.ndarray, frame_index: int = 0) -> FrameResult:
-        h, w = frame_bgr.shape[:2]
-        x = self._preprocess(frame_bgr)
+        x, (h, w) = self._preprocess(frame_bgr)
 
         with torch.no_grad():
             outputs: Dict[str, torch.Tensor] = self.model(x)
@@ -148,9 +169,10 @@ class AquaDetPipeline:
         logits = outputs["logits"]
         boxes = outputs["boxes"]
         masks = outputs["masks"]
+        obj = outputs["obj"]
         depth_map = outputs["depth"]
 
-        decoded = self._decode_predictions(logits, boxes, h, w)
+        decoded = self._decode_predictions(logits, boxes, obj, h, w)
         bboxes = [d["bbox"] for d in decoded]
         tracks = self.tracker.update(bboxes)
 
@@ -158,11 +180,19 @@ class AquaDetPipeline:
         mask_full_res = cv2.resize(mask_map, (w, h), interpolation=cv2.INTER_LINEAR)
         mask_binary = (mask_full_res >= 0.5).astype(np.uint8)
 
+        # Compute focal length in pixels for this frame size
+        focal_length_px = focal_length_mm_to_px(
+            self.focal_length_mm, w, self.sensor_width_mm,
+        )
+
         detections: List[Detection] = []
         for track, pred in zip(tracks, decoded):
             x1, y1, x2, y2 = track.bbox
             cls_idx = int(pred["class_idx"])
             conf = float(pred["confidence"])
+
+            # Clamp class index to valid range
+            cls_idx = min(cls_idx, len(self.class_names) - 1)
 
             depth_crop = depth_map[0, 0]
             dh, dw = depth_crop.shape
@@ -174,7 +204,7 @@ class AquaDetPipeline:
             pixel_size = float(max(x2 - x1, y2 - y1))
             real_size_mm = estimate_real_size_mm(
                 pixel_size=pixel_size,
-                focal_length_mm=self.focal_length_mm,
+                focal_length_px=focal_length_px,
                 depth_m=depth_value,
             )
 
@@ -183,7 +213,7 @@ class AquaDetPipeline:
 
             detections.append(
                 Detection(
-                    class_name=CLASS_NAMES[cls_idx],
+                    class_name=self.class_names[cls_idx],
                     confidence=conf,
                     bbox_xyxy=(x1, y1, x2, y2),
                     mask=obj_mask,

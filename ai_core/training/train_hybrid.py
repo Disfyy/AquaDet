@@ -9,11 +9,20 @@ from typing import Dict, List, Tuple
 import cv2
 import torch
 import yaml
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
 from torch import nn
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset, random_split
 
 from ai_core.models.hybrid_model import AquaDetHybridModel
+from ai_core.training.losses import FocalLoss, CIoULoss, UncertaintyWeightedLoss
+from ai_core.training.ema import ModelEMA
+
+
+# ---------------------------------------------------------------------------
+# Datasets
+# ---------------------------------------------------------------------------
 
 
 class DummyAquaDataset(Dataset):
@@ -62,9 +71,10 @@ class DummyAquaDataset(Dataset):
 
 
 class MultiSourceAquaDataset(Dataset):
-    def __init__(self, image_dirs: List[Path], image_size: int = 640, num_classes: int = 4):
+    def __init__(self, image_dirs: List[Path], image_size: int = 640, num_classes: int = 4, is_train: bool = True):
         self.image_size = image_size
         self.num_classes = num_classes
+        self.is_train = is_train
         self.images: List[Path] = []
         for image_dir in image_dirs:
             if not image_dir.exists():
@@ -75,6 +85,24 @@ class MultiSourceAquaDataset(Dataset):
         self.images = sorted(set(self.images))
         if not self.images:
             raise ValueError("No training images found in configured data.image_dirs")
+
+        # Set up Albumentations pipeline
+        if self.is_train:
+            self.transform = A.Compose([
+                A.Resize(height=image_size, width=image_size),
+                A.HorizontalFlip(p=0.5),
+                A.RandomRotate90(p=0.5),
+                A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=0.7),
+                A.GaussNoise(p=0.3),
+                A.ToFloat(max_value=255.0),
+                ToTensorV2(),
+            ], bbox_params=A.BboxParams(format='yolo', label_fields=['class_labels'], min_visibility=0.3))
+        else:
+            self.transform = A.Compose([
+                A.Resize(height=image_size, width=image_size),
+                A.ToFloat(max_value=255.0),
+                ToTensorV2(),
+            ], bbox_params=A.BboxParams(format='yolo', label_fields=['class_labels']))
 
     def __len__(self) -> int:
         return len(self.images)
@@ -95,10 +123,9 @@ class MultiSourceAquaDataset(Dataset):
             raise RuntimeError(f"Failed to read image: {image_path}")
 
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-        image_rgb = cv2.resize(image_rgb, (self.image_size, self.image_size), interpolation=cv2.INTER_LINEAR)
-        image_tensor = torch.from_numpy(image_rgb).permute(2, 0, 1).float() / 255.0
 
-        labels: List[Tuple[int, float, float, float, float]] = []
+        raw_bboxes = []
+        raw_labels = []
 
         label_path = self._label_file_path(image_path)
         if label_path.exists():
@@ -110,9 +137,27 @@ class MultiSourceAquaDataset(Dataset):
                     try:
                         cls_idx = int(float(parts[0])) % self.num_classes
                         cx, cy, bw, bh = (float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4]))
-                        labels.append((cls_idx, cx, cy, bw, bh))
+                        
+                        bw = min(1.0, max(0.001, bw))
+                        bh = min(1.0, max(0.001, bh))
+                        cx = min(1.0, max(0.0, cx))
+                        cy = min(1.0, max(0.0, cy))
+                        
+                        raw_bboxes.append([cx, cy, bw, bh])
+                        raw_labels.append(cls_idx)
                     except ValueError:
                         continue
+
+        if hasattr(self, 'transform') and self.transform:
+            augmented = self.transform(image=image_rgb, bboxes=raw_bboxes, class_labels=raw_labels)
+            image_tensor = augmented['image']
+            aug_bboxes = augmented['bboxes']
+            aug_labels = augmented['class_labels']
+            labels = [(cls, *bbox) for cls, bbox in zip(aug_labels, aug_bboxes)]
+        else:
+            image_rgb = cv2.resize(image_rgb, (self.image_size, self.image_size), interpolation=cv2.INTER_LINEAR)
+            image_tensor = torch.from_numpy(image_rgb).permute(2, 0, 1).float() / 255.0
+            labels = [(cls, *bbox) for cls, bbox in zip(raw_labels, raw_bboxes)]
 
         p3 = self.image_size // 2
         cls_map = torch.full((p3, p3), fill_value=-100, dtype=torch.long)
@@ -147,6 +192,11 @@ class MultiSourceAquaDataset(Dataset):
             "mask": seg_map,
             "depth": depth_map,
         }
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 
 def load_config(path: Path) -> Dict[str, Dict]:
@@ -185,8 +235,13 @@ def autocast_context(use_cuda: bool):
     return nullcontext()
 
 
+# ---------------------------------------------------------------------------
+# Main training loop
+# ---------------------------------------------------------------------------
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train AquaDet hybrid model (Phase-2/3 skeleton).")
+    parser = argparse.ArgumentParser(description="Train AquaDet hybrid model.")
     parser.add_argument("--config", type=Path, default=Path("configs/hybrid_train.yaml"))
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch", type=int, default=None)
@@ -203,7 +258,6 @@ def main() -> None:
     cfg = load_config(args.config)
     model_cfg = cfg.get("model", {})
     train_cfg = cfg.get("train", {})
-    loss_cfg = cfg.get("loss_weights", {})
     data_cfg = cfg.get("data", {})
 
     num_classes = int(model_cfg.get("num_classes", 4))
@@ -214,15 +268,11 @@ def main() -> None:
     lr = float(args.lr if args.lr is not None else train_cfg.get("lr", 1e-4))
     image_size = int(args.imgsz if args.imgsz is not None else train_cfg.get("image_size", 640))
 
-    w_cls = float(loss_cfg.get("cls", 1.0))
-    w_bbox = float(loss_cfg.get("bbox", 2.0))
-    w_mask = float(loss_cfg.get("mask", 1.0))
-    w_depth = float(loss_cfg.get("depth", 0.2))
-
     train_image_dirs = [Path(p) for p in data_cfg.get("train_image_dirs", [])]
     val_image_dirs = [Path(p) for p in data_cfg.get("val_image_dirs", [])]
     image_dirs = [Path(p) for p in data_cfg.get("image_dirs", [])]
 
+    # ---- Build datasets ----
     if train_image_dirs:
         try:
             train_dataset = MultiSourceAquaDataset(
@@ -235,10 +285,21 @@ def main() -> None:
             train_dataset = DummyAquaDataset(image_size=image_size, num_classes=num_classes)
     elif image_dirs:
         try:
+            import copy
             full_dataset = MultiSourceAquaDataset(image_dirs=image_dirs, image_size=image_size, num_classes=num_classes)
             val_len = max(1, int(0.1 * len(full_dataset)))
             train_len = max(1, len(full_dataset) - val_len)
             train_dataset, val_dataset_split = random_split(full_dataset, [train_len, val_len])
+            
+            val_dataset_base = copy.deepcopy(full_dataset)
+            val_dataset_base.is_train = False
+            val_dataset_base.transform = A.Compose([
+                A.Resize(height=image_size, width=image_size),
+                A.ToFloat(max_value=255.0),
+                ToTensorV2(),
+            ], bbox_params=A.BboxParams(format='yolo', label_fields=['class_labels']))
+            val_dataset_split.dataset = val_dataset_base
+            
             val_dataset = val_dataset_split
         except ValueError as exc:
             print(f"{exc}. Falling back to synthetic dataset. Update data.image_dirs in {args.config}")
@@ -256,6 +317,7 @@ def main() -> None:
                     image_dirs=val_image_dirs,
                     image_size=image_size,
                     num_classes=num_classes,
+                    is_train=False
                 )
             except ValueError:
                 val_dataset = DummyAquaDataset(image_size=image_size, num_classes=num_classes)
@@ -286,20 +348,45 @@ def main() -> None:
         flush=True,
     )
 
+    # ---- Model ----
     model = AquaDetHybridModel(num_classes=num_classes, pi_ge_enabled=pi_ge_enabled).to(device)
-    optimizer = AdamW(model.parameters(), lr=lr)
-    cls_loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
-    bbox_loss_fn = nn.SmoothL1Loss()
+
+    # ---- Optimizer ----
+    optimizer = AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+
+    # ---- Loss functions ----
+    cls_loss_fn = FocalLoss(num_classes=num_classes, alpha=0.25, gamma=2.0, ignore_index=-100)
+    bbox_loss_fn = CIoULoss()
+    obj_loss_fn = nn.BCEWithLogitsLoss()
     mask_loss_fn = nn.BCEWithLogitsLoss()
     depth_loss_fn = nn.L1Loss()
+
+    # Learnable multi-task loss weighting (5 tasks: cls, bbox, obj, mask, depth)
+    mtl_weighter = UncertaintyWeightedLoss(num_tasks=5).to(device)
+    # Add weighter params to optimiser
+    optimizer.add_param_group({"params": mtl_weighter.parameters(), "lr": lr})
+
+    # ---- Scheduler ----
+    from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+    warmup_epochs = min(5, max(1, epochs // 10))
+    warmup = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_epochs)
+    cosine = CosineAnnealingLR(optimizer, T_max=max(1, epochs - warmup_epochs), eta_min=1e-6)
+    scheduler = SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[warmup_epochs])
+
     scaler = build_grad_scaler(use_cuda=use_cuda)
 
+    # ---- EMA ----
+    ema = ModelEMA(model, decay=0.9999, device=device)
+
+    # ---- Checkpointing ----
     checkpoint_dir = args.out.parent / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     best_path = args.out.parent / "hybrid_model_best.pt"
     best_score = -1e9
 
-    model.train()
+    # ==================================================================
+    # Training loop
+    # ==================================================================
     for epoch in range(epochs):
         model.train()
         total_loss = 0.0
@@ -310,38 +397,49 @@ def main() -> None:
             optimizer.zero_grad(set_to_none=True)
             with autocast_context(use_cuda=use_cuda):
                 outputs = model(images)
+
                 cls_logits = outputs["logits"]
                 box_pred = torch.sigmoid(outputs["boxes"])
                 mask_logits = outputs["masks"].squeeze(1)
+                obj_logits = outputs["obj"].squeeze(1)
                 depth_pred = outputs["depth"]
 
+                # Classification (Focal Loss)
                 cls_loss = cls_loss_fn(cls_logits, targets["cls"])
 
+                # Objectness (BCE)
+                obj_loss = obj_loss_fn(obj_logits, targets["obj"])
+
+                # Bounding box (CIoU on positive cells only)
                 obj_bool = targets["obj"] > 0.5
                 pred_box_flat = box_pred.permute(0, 2, 3, 1)[obj_bool]
                 target_box_flat = targets["box"].permute(0, 2, 3, 1)[obj_bool]
-                if pred_box_flat.numel() > 0:
-                    bbox_loss = bbox_loss_fn(pred_box_flat, target_box_flat)
-                else:
-                    bbox_loss = torch.zeros(1, device=device, dtype=cls_loss.dtype).squeeze(0)
+                bbox_loss = bbox_loss_fn(pred_box_flat, target_box_flat)
 
-                mask_target = targets["mask"]
-                mask_loss = mask_loss_fn(mask_logits, mask_target)
+                # Mask (BCE)
+                mask_loss = mask_loss_fn(mask_logits, targets["mask"])
+
+                # Depth (L1)
                 depth_loss = depth_loss_fn(depth_pred, targets["depth"])
 
-                loss = w_cls * cls_loss + w_bbox * bbox_loss + w_mask * mask_loss + w_depth * depth_loss
+                # Combined with learned uncertainty weighting
+                loss = mtl_weighter(cls_loss, bbox_loss, obj_loss, mask_loss, depth_loss)
 
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
             scaler.step(optimizer)
             scaler.update()
+
+            ema.update(model)
             total_loss += float(loss.item())
 
             if args.log_interval > 0 and step % args.log_interval == 0:
                 print(
                     f"epoch={epoch+1} step={step}/{len(train_loader)} "
                     f"loss={float(loss.item()):.4f} cls={float(cls_loss.item()):.4f} "
-                    f"bbox={float(bbox_loss.item()):.4f} mask={float(mask_loss.item()):.4f} "
-                    f"depth={float(depth_loss.item()):.4f}",
+                    f"obj={float(obj_loss.item()):.4f} bbox={float(bbox_loss.item()):.4f} "
+                    f"mask={float(mask_loss.item()):.4f} depth={float(depth_loss.item()):.4f}",
                     flush=True,
                 )
             if args.max_train_steps > 0 and step >= args.max_train_steps:
@@ -349,41 +447,43 @@ def main() -> None:
 
         train_loss = total_loss / max(1, len(train_loader))
 
+        # ==============================================================
+        # Validation
+        # ==============================================================
         model.eval()
         val_loss_total = 0.0
         val_cls_correct = 0
         val_cls_total = 0
         val_mask_iou = 0.0
+
         with torch.no_grad():
             for val_step, (images, targets) in enumerate(val_loader, start=1):
                 images = images.to(device, non_blocking=True)
                 targets = to_device(targets, device)
 
-                outputs = model(images)
+                outputs = ema.module(images)
                 cls_logits = outputs["logits"]
                 box_pred = torch.sigmoid(outputs["boxes"])
                 mask_logits = outputs["masks"].squeeze(1)
+                obj_logits = outputs["obj"].squeeze(1)
                 depth_pred = outputs["depth"]
 
                 cls_loss = cls_loss_fn(cls_logits, targets["cls"])
+                obj_loss = obj_loss_fn(obj_logits, targets["obj"])
                 obj_bool = targets["obj"] > 0.5
                 pred_box_flat = box_pred.permute(0, 2, 3, 1)[obj_bool]
                 target_box_flat = targets["box"].permute(0, 2, 3, 1)[obj_bool]
-                if pred_box_flat.numel() > 0:
-                    bbox_loss = bbox_loss_fn(pred_box_flat, target_box_flat)
-                else:
-                    bbox_loss = torch.zeros(1, device=device, dtype=cls_loss.dtype).squeeze(0)
-
-                mask_target = targets["mask"]
-                mask_loss = mask_loss_fn(mask_logits, mask_target)
+                bbox_loss = bbox_loss_fn(pred_box_flat, target_box_flat)
+                mask_loss = mask_loss_fn(mask_logits, targets["mask"])
                 depth_loss = depth_loss_fn(depth_pred, targets["depth"])
-                val_loss = w_cls * cls_loss + w_bbox * bbox_loss + w_mask * mask_loss + w_depth * depth_loss
+
+                val_loss = mtl_weighter(cls_loss, bbox_loss, obj_loss, mask_loss, depth_loss)
                 val_loss_total += float(val_loss.item())
 
                 pred_cls = cls_logits.argmax(dim=1)
                 val_cls_correct += int(((pred_cls == targets["cls"]) & obj_bool).sum().item())
                 val_cls_total += int(obj_bool.sum().item())
-                val_mask_iou += compute_mask_iou(mask_logits, mask_target)
+                val_mask_iou += compute_mask_iou(mask_logits, targets["mask"])
                 if args.max_val_steps > 0 and val_step >= args.max_val_steps:
                     break
 
@@ -392,23 +492,34 @@ def main() -> None:
         val_mask_iou_avg = float(val_mask_iou / max(1, len(val_loader)))
         score = val_cls_acc + val_mask_iou_avg - 0.1 * val_loss_avg
 
+        # Print learned task weights for monitoring
+        task_names = ["cls", "bbox", "obj", "mask", "depth"]
+        weights_str = " ".join(
+            f"w_{t}={torch.exp(-mtl_weighter.log_vars[i]).item():.3f}"
+            for i, t in enumerate(task_names)
+        )
+
         print(
             f"epoch={epoch+1} train_loss={train_loss:.4f} val_loss={val_loss_avg:.4f} "
-            f"val_cls_acc={val_cls_acc:.4f} val_mask_iou={val_mask_iou_avg:.4f} score={score:.4f}",
+            f"val_cls_acc={val_cls_acc:.4f} val_mask_iou={val_mask_iou_avg:.4f} "
+            f"score={score:.4f} lr={scheduler.get_last_lr()[0]:.6f} "
+            f"ema_decay={ema.decay:.6f} {weights_str}",
             flush=True,
         )
 
+        scheduler.step()
+
         if (epoch + 1) % max(1, args.save_every) == 0:
             epoch_path = checkpoint_dir / f"epoch_{epoch+1:03d}.pt"
-            torch.save(model.state_dict(), epoch_path)
+            torch.save(ema.module.state_dict(), epoch_path)
 
         if score > best_score:
             best_score = score
-            torch.save(model.state_dict(), best_path)
+            torch.save(ema.module.state_dict(), best_path)
             print(f"Saved best checkpoint: {best_path}", flush=True)
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(model.state_dict(), args.out)
+    torch.save(ema.module.state_dict(), args.out)
     print(f"Saved: {args.out}", flush=True)
 
 

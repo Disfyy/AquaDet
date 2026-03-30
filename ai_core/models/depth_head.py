@@ -7,26 +7,55 @@ import torch.nn.functional as F
 
 class DepthHead(nn.Module):
     """Monocular Depth Estimation Head.
-    
-    Uses Atrous Spatial Pyramid Pooling (ASPP) to capture multi-scale 
-    context for robust depth perception in underwater environments, 
-    crucial for accurate real-world size estimation.
+
+    Uses Atrous Spatial Pyramid Pooling (ASPP) to capture multi-scale
+    context for robust depth perception in underwater environments.
+    Accepts concatenated multi-scale features (P3+P4+P5) for global context.
     """
-    def __init__(self, in_channels: int = 128):
+
+    def __init__(self, in_channels: int = 384):
+        """Initialise depth head.
+
+        Args:
+            in_channels: Number of input channels.  When fed the concatenation
+                of P3+P4+P5 (each 128ch), this should be 384.
+        """
         super().__init__()
-        
-        # Multi-scale receptive fields to understand global vs local context
-        self.branch1 = nn.Conv2d(in_channels, 32, kernel_size=1)
-        self.branch2 = nn.Conv2d(in_channels, 32, kernel_size=3, padding=6, dilation=6)
-        self.branch3 = nn.Conv2d(in_channels, 32, kernel_size=3, padding=12, dilation=12)
-        
+
+        # Reduce channel count from the concatenated input
+        self.reduce = nn.Sequential(
+            nn.Conv2d(in_channels, 128, 1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+        )
+
+        # Multi-scale ASPP branches (operate on 128ch)
+        self.branch1 = nn.Sequential(
+            nn.Conv2d(128, 32, kernel_size=3, padding=1, dilation=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+        )
+        self.branch2 = nn.Sequential(
+            nn.Conv2d(128, 32, kernel_size=3, padding=6, dilation=6),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+        )
+        self.branch3 = nn.Sequential(
+            nn.Conv2d(128, 32, kernel_size=3, padding=12, dilation=12),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+        )
+
         # Global context branch
         self.global_pool = nn.AdaptiveAvgPool2d(1)
-        self.global_conv = nn.Conv2d(in_channels, 32, kernel_size=1)
-        
+        self.global_conv = nn.Sequential(
+            nn.Conv2d(128, 32, kernel_size=1),
+            nn.ReLU(inplace=True),
+        )
+
         # Fusion and final depth prediction
         self.fusion = nn.Sequential(
-            nn.Conv2d(32 * 4, 64, kernel_size=3, padding=1),
+            nn.Conv2d(32 * 4, 64, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
             nn.Conv2d(64, 1, kernel_size=1),
@@ -34,20 +63,18 @@ class DepthHead(nn.Module):
         )
 
     def forward(self, feature_map: torch.Tensor) -> torch.Tensor:
-        h, w = feature_map.shape[2:]
-        
-        # Extract features at different receptive scales
-        b1 = self.branch1(feature_map)
-        b2 = self.branch2(feature_map)
-        b3 = self.branch3(feature_map)
-        
-        # Global context
-        bg = self.global_pool(feature_map)
+        x = self.reduce(feature_map)
+        h, w = x.shape[2:]
+
+        b1 = self.branch1(x)
+        b2 = self.branch2(x)
+        b3 = self.branch3(x)
+
+        bg = self.global_pool(x)
         bg = self.global_conv(bg)
         bg = F.interpolate(bg, size=(h, w), mode='bilinear', align_corners=False)
-        
-        # Concat and fuse
+
         fused = torch.cat([b1, b2, b3, bg], dim=1)
-        
-        # Absolute depth in meters + 0.1m safety buffer
+
+        # Depth in meters with 0.1m safety floor
         return self.fusion(fused) + 0.1
